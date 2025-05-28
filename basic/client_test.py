@@ -25,5 +25,5 @@ async def _hit(client):
 
 
 if __name__ == '__main__':
-    asyncio.run(hit(9))
+    asyncio.run(hit(20))
 

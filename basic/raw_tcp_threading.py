@@ -17,7 +17,7 @@ def create(host, port):
 
     raw_tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # specify that I want a tcp socket and want to use ipv4
     raw_tcp_socket.bind((host, port))
-    raw_tcp_socket.listen(5) # set backlog as 5
+    raw_tcp_socket.listen(10) # set backlog as 5
 
     executor = ThreadPoolExecutor(max_workers=50)
 
