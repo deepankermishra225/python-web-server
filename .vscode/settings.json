@@ -1,0 +1,7 @@
+{
+    "python.pythonPath": "/Users/deepanker/Desktop/projects/python-web-server /Users/deepanker/Desktop/projects/python-web-server/.venv/bin/python /Users/deepanker/Desktop/projects/python-web-server",
+    "python.analysis.extraPaths": [
+        "./"
+    ],
+    "python.autoComplete.extraPaths": ["./"]
+}

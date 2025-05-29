@@ -6,8 +6,10 @@ Read rate is dependent on the asgi application's ability to process incoming dat
 internal state of the Transport class. 
 """
 
-
 import asyncio
+
+HIGH_WATER_LIMIT_READ = 65536  # Pause reading if internal buffer exceeds this (bytes)
+LOW_WATER_LIMIT_READ = 16384   # Resume reading if internal buffer drops below this (bytes)
 
 
 class FlowControl:
