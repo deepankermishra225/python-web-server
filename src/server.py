@@ -8,7 +8,6 @@ import threading
 import click
 from .server_state import ServerState
 from .http_conn import HTTPConn
-import time
 
 
 HANDLED_SIGNALS = {
@@ -16,7 +15,7 @@ HANDLED_SIGNALS = {
     signal.SIGTERM: "SIGTERM",
 }
 if sys.platform == "win32":
-    HANDLED_SIGNALS[signal.SIGBREAK] = "SIGBREAK"
+    HANDLED_SIGNALS[signal.SIGBREAK] = "SIGBREAK"   
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +45,7 @@ class Server:
         self.should_exit = False
         self.force_exit = False
         self._captured_signals: list[int] = []
+        self.server = None
     
     def run(self) -> None:
         return asyncio.run(self.serve())
@@ -73,6 +73,7 @@ class Server:
                                               ssl=self.config.ssl,
                                               backlog=self.config.backlog
                                               )
+            self.server = server
             self._log_startup_message(server.sockets[0])
 
         except OSError as exc:
@@ -122,7 +123,60 @@ class Server:
     
 
     async def shutdown(self)-> None:
-        ...
+        logger.info("Shutting down server...")
+        # Stop accepting new connections:
+        self.server.close()
+
+        """
+        connection.shutdown(): This calls a method on each individual asyncio.Protocol instance (e.g., H11Protocol). This shutdown() method within the protocol is designed to:
+        Stop reading from the client: Prevent further data processing for that connection.
+        Attempt to finish writing: Complete sending any pending responses or data to the client.
+        Close the connection gracefully: Send appropriate closing messages (e.g., HTTP Connection: close header, WebSocket close frames).
+        """
+        for connection in list(self.server_state.connections):
+            connection.shutdown()
+
+        """
+        The most important reason. It gives the asyncio event loop a chance to actually run the asynchronous code within those connection.shutdown() calls.
+        Without this sleep, the shutdown coroutine would immediately proceed to the next line of code,
+        If shutdown didn't yield, the connections wouldn't have had any time to start sending their closing messages, and the self.server_state.connections set might still be full,
+        leading to unnecessary waiting in the subsequent _wait_tasks_to_complete method, or even preventing a truly graceful shutdown if a force_exit happens too quickly.
+        """
+        await asyncio.sleep(0.1)
+
+        try:
+            await asyncio.wait_for(
+                self._wait_tasks_to_complete(),
+                timeout=self.config.timeout_graceful_shutdown
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Graceful shutdown timed out. Forcing exit."
+            )
+            for t in self.server_state.tasks:
+                if not t.done():
+                    t.cancel(msg="Task cancelled due to timeout during graceful shutdown")
+
+    
+    async def _wait_tasks_to_complete(self) -> None:
+        """
+        Wait for all tasks to complete. This is important to ensure that all background tasks, such as request handlers,
+        have finished processing before the server shuts down.
+        """
+        # Wait for exisiting connections to finish sending responses
+        if self.server_state.connections and not self.force_exit:
+            logger.info("Waiting for connections to close . (CTRL+C to force quit)")
+            while self.server_state.connections and not self.force_exit:
+                await asyncio.sleep(0.1)
+        
+        # Wait for exisiting tasks to finish
+        if self.server_state.tasks and not self.force_exit:
+            logger.info("Waiting for background tasks to complete . (CTRL+C to force quit)")
+            while self.server_state.tasks and not self.force_exit:
+                await asyncio.sleep(0.1)
+
+        await self.server.wait_closed()
+
 
     # signal handling
     @contextlib.contextmanager
