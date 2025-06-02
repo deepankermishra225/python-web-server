@@ -28,12 +28,14 @@ class Config:
             host,
             port,
             ssl,
-            backlog
+            backlog,
+            timeout_graceful_shutdown
     ):
         self.host = host
         self.port = port
         self.ssl = ssl
         self.backlog = backlog
+        self.timeout_graceful_shutdown = timeout_graceful_shutdown
 
 
 class Server:
@@ -101,11 +103,13 @@ class Server:
 
 
     async def main_loop(self) -> None:
-        counter = 0
-        should_exit = await self.on_tick(counter)
-        while not should_exit:
-            counter +=1
-            counter = counter % (24*3600*10)
+        """
+        instead of using 
+        async with server:
+            await server.serve_forever()
+        we use a custom loop to allow for graceful shutdown and signal handling.
+        """
+        while not self.should_exit:
             """
             While main_loop is paused, the asyncio event loop is free to do other work. This includes:
             Accepting new client connections.
@@ -114,16 +118,7 @@ class Server:
             Responding to signals (like SIGINT or SIGTERM which would then set self.should_exit = True via the handle_exit method).
             """
             await asyncio.sleep(0.1)
-            should_exit = await self.on_tick(counter)
-
-
-    async def on_tick(self, counter: int) -> bool:
-        """
-        This method is called every 100ms in the main loop.
-        It can be used to perform periodic tasks.
-        """
-        if counter%10 == 0:
-            current_time = time.time()
+        
     
 
     async def shutdown(self)-> None:
