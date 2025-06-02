@@ -160,6 +160,15 @@ class Server:
     
     async def _wait_tasks_to_complete(self) -> None:
         """
+        why shutdowns connections first and then check the same for tasks ?
+        your ASGI app spawns asyncio.create_task() or uses a library like FastAPI's BackgroundTasks, these tasks run independently of the original client connection. 
+        The client connection might close long before these background tasks finish. Uvicorn wants to wait for these to complete to ensure all application work is done.
+
+        Imagine a task just finishes its processing, but the connection is already in a final state of being torn down and might have been removed 
+        from self.server_state.connections slightly before the task itself is removed from self.server_state.tasks. Its basically a defensive measure.
+        """    
+
+        """
         Wait for all tasks to complete. This is important to ensure that all background tasks, such as request handlers,
         have finished processing before the server shuts down.
         """
