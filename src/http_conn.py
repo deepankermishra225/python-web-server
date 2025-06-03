@@ -13,6 +13,7 @@ When using asyncio.Protocol, requried methods include:
 """
 import logging
 import asyncio
+import http
 from typing import Literal
 from ._types import ASGIVersions, HTTPScope
 from .flow_control import FlowControl
@@ -22,6 +23,14 @@ import h11
 from .util import get_local_addr, get_remote_addr, is_ssl
 
 logger = logging.getLogger(__name__)
+
+def _get_status_phrase(status_code: int) -> bytes:
+    try:
+        return http.HTTPStatus(status_code).phrase.encode()
+    except ValueError:
+        return b""
+
+STATUS_PHRASES = {status_code: _get_status_phrase(status_code) for status_code in range(100, 600)}
 
 class RequestResponseCycle:
 
@@ -102,19 +111,69 @@ class HTTPConn(asyncio.Protocol):
         if exc is None: # graceful shutdown when client closes connection or server closes connection by calling transport.close()
             self.transport.close()  # idempotent call
 
+    def eof_received(self):
+        return None
 
     def data_received(self, data: bytes):
         logger.debug(f"Data received: {data.decode()}")
-        asyncio.create_task(self._handle_data(data))
+        self.conn.receive_data(data)
+        self.handle_events()
         
 
-    async def _handle_data(self, data: bytes):
-        logger.debug(f"Handling data: {data.decode()}")
-        if self.flow_control:
-            await self.flow_control.drain()
-        if self.transport:
-            self.transport.write(data)
-            logger.debug(f"Data sent: {data.decode()}")
+    def handle_events(self):
+        while True:
+            try:
+                event = self.conn.next_event()
+            except h11.RemoteProtocolError:
+                msg = "Invalid HTTP request recieved"
+                logger.error(msg)
+                self.send_400_response(msg)
+
+            if event is h11.NEED_DATA:
+                return
+            
+            if isinstance(event, h11.PAUSED):
+                """
+                Ocurrs during HTTP pipeling -> multiple requests back-to-back on the same TCP connection without waiting for previous response. Server, however is 
+                expected to reply in the same order as requests were received.
+                E.g. - Server receives GET /foo and starts responding. The second request GET /bar has already arrived and is buffered.
+                But the server must not start processing GET /bar until it finishes responding to GET /foo
+                """
+                self.flow.pause_reading()
+                return
+            
+            if isinstance(event, h11.Data):
+                if self.conn.our_state is h11.DONE:
+                    continue
+
+            if isinstance(event, h11.EndOfMessage):
+                if self.conn.our_state is h11.DONE:
+                    self.transport.resume_reading()
+                    self.conn.start_next_cycle()
+                    continue
+                self.cycle.more_body = False
+                self.cycle.message_event.set()
+                if self.conn.their_state == h11.MUST_CLOSE:
+                    break
+
+    
+    def send_400_response(self, msg: str):
+        reason = STATUS_PHRASES[400]
+        headers = [
+            (b"content-type", b"text/plain; charset=utf-8"),
+            (b"connection", "close"),
+        ]
+        event = h11.Response(status_code=400, headers=headers, reason=reason)
+        output = self.conn.send(event)
+        self.transport.write(output)
+
+        output = self.conn.send(event=h11.Data(data=msg.encode("ascii")))
+        self.transport.write(output)
+
+        output = self.conn.send(event=h11.EndOfMessage())
+        self.transport.write(output)
+
+        self.transport.close()
 
 
 async def main():
