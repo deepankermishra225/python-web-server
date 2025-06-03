@@ -8,6 +8,7 @@ import threading
 import click
 from .server_state import ServerState
 from .http_conn import HTTPConn
+from .config import Config
 
 
 HANDLED_SIGNALS = {
@@ -19,22 +20,6 @@ if sys.platform == "win32":
 
 
 logger = logging.getLogger(__name__)
-
-class Config:
-
-    def __init__(
-            self,
-            host,
-            port,
-            ssl,
-            backlog,
-            timeout_graceful_shutdown
-    ):
-        self.host = host
-        self.port = port
-        self.ssl = ssl
-        self.backlog = backlog
-        self.timeout_graceful_shutdown = timeout_graceful_shutdown
 
 
 class Server:
@@ -67,7 +52,9 @@ class Server:
     async def startup(self) -> None:
         try:
             loop = asyncio.get_running_loop()
-            server = await loop.create_server(HTTPConn, 
+            server = await loop.create_server(HTTPConn(config=self.config,
+                                              server_state=self.server_state,
+                                              loop=loop),    
                                               host=self.config.host,
                                               port=self.config.port,
                                               ssl=self.config.ssl,

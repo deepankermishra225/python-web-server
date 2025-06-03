@@ -14,23 +14,51 @@ When using asyncio.Protocol, requried methods include:
 import logging
 import asyncio
 from typing import Literal
+from ._types import ASGIVersions, HTTPScope
 from .flow_control import FlowControl
+from .server_state import SeverState
+from .config import Config
+import h11
 
 logger = logging.getLogger(__name__)
+
+class RequestResponseCycle:
+
+    def __init__(self,
+                 scope: HTTPScope,
+                 conn: h11.Connection,
+                 transport: asyncio.Transport,
+                 flow: FlowControl):
+        self.scope = scope
+        self.conn = conn
+        self.transport = transport
+        self.flow = flow
+
+
 
 class HTTPConn(asyncio.Protocol):
 
     def __init__(self, 
-                 app, 
+                 config: Config,
+                 server_state: SeverState,
                  loop: asyncio.AbstractEventLoop | None = None):
         self.loop = loop or asyncio.get_event_loop()
-        self.app = app
+        self.config = config
+        self.conn = h11.Connection(h11.SERVER)
+
+        # Per-connection state
         self.transport: asyncio.Transport | None = None
         self.flow_control: FlowControl| None = None
-        self.connections = []
         self.client: tuple[str, int] | None = None
         self.server: tuple[str, int] | None = None
         self.scheme = Literal["http", "https"] | None = None
+
+        # Shared server state
+        self.server_state = server_state
+        self.connections = server_state.connections
+        self.tasks = server_state.tasks
+        
+        self.cycle: RequestResponseCycle | None = None
 
     def connection_made(self, transport: asyncio.Transport):
         self.connections.append(self)
@@ -88,7 +116,7 @@ async def main():
     loop = asyncio.get_running_loop()
 
     server = await loop.create_server(
-        lambda: Server(),
+        lambda: HTTPConn(), 
         host='127.0.0.1',
         port=8081
     )
