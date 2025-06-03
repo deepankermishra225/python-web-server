@@ -19,6 +19,7 @@ from .flow_control import FlowControl
 from .server_state import SeverState
 from .config import Config
 import h11
+from .util import get_local_addr, get_remote_addr, is_ssl
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +29,15 @@ class RequestResponseCycle:
                  scope: HTTPScope,
                  conn: h11.Connection,
                  transport: asyncio.Transport,
-                 flow: FlowControl):
+                 flow: FlowControl,
+                 message_event: asyncio.Event):
         self.scope = scope
         self.conn = conn
         self.transport = transport
         self.flow = flow
-
+        self.message_event = message_event
+        self.response_complete = False
+        self.disconnected = False
 
 
 class HTTPConn(asyncio.Protocol):
@@ -64,12 +68,40 @@ class HTTPConn(asyncio.Protocol):
         self.connections.append(self)
         self.transport = transport
         self.flow_control = FlowControl(transport)
-        logger.debug(f"Connection made with {transport.get_extra_info('peername')}")
+        self.client = get_remote_addr(transport)
+        self.server = get_local_addr(transport)
+        self.scheme = "https" if is_ssl(transport) else "http"
 
-        transport.set_write_buffer_limits(
-            high=transport.get_write_buffer_limits()[1],
-            low=transport.get_write_buffer_limits()[0]
-        )
+    def connection_lost(self, exc: Exception | None = None) -> None:
+        """
+        This method is called when:
+        1. peer closes connection (gracefully), or when the server closes connection (gracefully)
+        2. network error / abrupt disconnect.
+
+
+        Completing an HTTP Request does not necessarily call connection_lost (depends if connection is keep-alive or close).
+        """
+        self.connections.discard(self)
+
+        if self.cycle and not self.cycle.response_complete:
+            self.cycle.disconnected = True
+        if self.conn.our_state != h11.ERROR:
+            event = h11.ConnectionClosed()
+            try:
+                self.conn.send(event)
+            except h11.LocalProtocolError:
+                pass
+        if self.cycle:
+            self.cycle.message_event.set()
+        if self.flow is not None:
+            self.flow.resume_writing()  # avoid deadlock or 'stalled' tasks.
+
+        """
+        when exception occurs, the underlying transport is already considerd broken or closed by the asyncio event loop
+        """
+        if exc is None: # graceful shutdown when client closes connection or server closes connection by calling transport.close()
+            self.transport.close()  # idempotent call
+
 
     def data_received(self, data: bytes):
         logger.debug(f"Data received: {data.decode()}")
@@ -83,32 +115,6 @@ class HTTPConn(asyncio.Protocol):
         if self.transport:
             self.transport.write(data)
             logger.debug(f"Data sent: {data.decode()}")
-
-    def pause_writing(self):
-        """
-        Called by transport when the write buffer exceeds the high water mark
-        """
-        logger.debug("Pausing reading")
-        if self.flow_control:
-            self.flow_control.pause_writing()
-
-    def resume_writing(self):
-        """
-        Called by the transport when the write buffer falls below the low water mark
-        """
-        logger.debug("Resuming reading")
-        if self.flow_control:
-            self.flow_control.resume_writing()
-
-    def connection_lost(self, exc: Exception | None):
-        logger.debug(f"Connection lost: {exc}")
-        self.transport = None
-        self.flow_control = None    
-        self.connections.discard(self)
-        if exc:
-            logger.error(f"Connection lost with error: {exc}")
-        else:
-            logger.info("Connection closed gracefully")
 
 
 async def main():
