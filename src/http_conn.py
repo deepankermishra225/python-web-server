@@ -22,6 +22,7 @@ from .config import Config
 import h11
 from .util import get_local_addr, get_remote_addr, is_ssl
 from urllib.parse import unquote
+from .service_unavailable import service_unavailable
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ class HTTPConn(asyncio.Protocol):
         self.scheme = Literal["http", "https"] | None = None
         self.root_path = config.root_path
         self.app_state = {}
+        self.limit_concurrency = config.limit_concurrency
 
         # Shared server state
         self.server_state = server_state
@@ -166,7 +168,27 @@ class HTTPConn(asyncio.Protocol):
                     server=self.server,
                     state=self.app_state.copy()
                 )
+
+                if self.limit_concurrency is not None and (
+                    len(self.connections) >= self.limit_concurrency or len(self.tasks) >= self.limit_concurrency
+                ):
+                    app = service_unavailable
+                    message = "Exceeded concurrency limit."
+                    self.logger.warning(message)
+                else:
+                    app = self.app
                 
+                self.cycle = RequestResponseCycle(
+                    scope=self.scope,
+                    conn=self.conn,
+                    transport=self.transport,
+                    flow=self.flow_control,
+                    message_event=asyncio.Event(),
+                    on_response=self.on_response_complete
+                )
+                task = self.loop.create_task(self.cycle.run_asgi(app))
+                task.add_done_callback(self.tasks.discard)
+                self.tasks.add(task)
 
             
             if isinstance(event, h11.PAUSED):
@@ -220,6 +242,41 @@ class HTTPConn(asyncio.Protocol):
         self.transport.write(output)
 
         self.transport.close()
+
+    def on_response_complete(self):
+        self.server_state.total_request+=1
+        if self.transport.is_closing():
+            return
+        
+        self.flow_resume_reading()
+
+        if self.conn.our_state is h11.DONE and self.conn.their_state is h11.DONE:
+            self.conn.start_next_cycle()
+            self.handle_events
+
+    def shutdown(self) -> None:
+        """
+        Called by the server to commence a graceful shutdown.
+        """
+        if self.cycle is None or self.cycle.response_complete:
+            event = h11.ConnectionClosed()
+            self.conn.send(event)
+            self.transport.close()
+        else:
+            self.cycle.keep_alive = False
+
+    def pause_writing(self) -> None:
+        """
+        Called by the transport when the write buffer exceeds the high water mark
+        """
+        self.flow_control.pause_writing()
+    
+    def resume_writing(self) -> None:
+        """
+        Called by the transport when the write buffer goes below the low water mark
+        """
+        self.flow_control.resume_writing()
+        
 
 
 async def main():
