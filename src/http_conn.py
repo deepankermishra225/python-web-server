@@ -53,6 +53,101 @@ class RequestResponseCycle:
         self.body = b""
         self.more_body = True
 
+    
+    async def run_asgi(self, app):
+        try:
+            await app(
+                self.scope, self.recieve, self.send
+            )
+        except BaseException as exc:
+            msg = "Exception in ASGI app: {}".format(exc)
+            logger.error(msg, exc_info=exc)
+            if not self.response_started:
+                await self.send_500_response()
+            else:
+                self.transport.close()
+        finally:
+            self.on_response = lambda: None
+
+    def send_500_response(self):
+        reason = STATUS_PHRASES[500]
+        headers = [
+            (b"content-type", b"text/plain; charset=utf-8"),
+            (b"connection", b"close"),
+        ]
+        event = h11.Response(status_code=500, headers=headers, reason=reason)
+        output = self.conn.send(event)
+        self.transport.write(output)
+
+        output = self.conn.send(event=h11.Data(data=b"Internal Server Error"))
+        self.transport.write(output)
+
+        output = self.conn.send(event=h11.EndOfMessage())
+        self.transport.write(output)
+
+        self.transport.close()
+
+    async def send(self, message):
+        message_type = message['type']
+        if self.flow.write_paused or not self.disconnected:
+            await self.flow.drain()
+
+        if self.disconnected:
+            return
+        
+        if not self.response_started:
+            if message_type != "http.response.start":
+                raise RuntimeError("Response not started before sending data.")
+            self.response_started = True
+            status_code = message['status']
+            reason = STATUS_PHRASES.get(status_code, b"")
+            headers = [(k.encode("ascii"), v.encode("ascii")) for k, v in message['headers']]
+            event = h11.Response(status_code=status_code, headers=headers, reason=reason)
+            output = self.conn.send(event)
+            self.transport.write(output)
+
+        elif not self.response_complete:
+            if message_type != "http.response.body":
+                raise RuntimeError("Response already started, cannot send headers.")
+            body = message.get("body", b"")
+            more_body = message.get("more_body", False)
+
+            """
+            They are used to retrieve the metadata about a resource (like Content-Length, Content-Type, Last-Modified, ETag) without having to transfer the entire resource itself. 
+            """
+            data = b"" if self.scope["method"] == "HEAD" else body
+            output = self.conn.send(event=h11.Data(data=data))
+            self.transport.write(output)
+
+            if not more_body:
+                self.response_complete = True
+                self.message_event.set()
+                output = self.conn.send(event=h11.EndOfMessage())
+                self.transport.write(output)
+        
+        else:
+            raise RuntimeError("Unexpected ASGI message")
+        
+
+    async def receive(self):
+        if not self.disconnected and not self.response_complete:
+            self.flow.resume_reading()
+            await self.message_event.wait()
+            self.message_event.clear()
+
+        if self.disconnected or self.response_complete:
+            return {
+                "type": "http.disconnect"
+            }
+        
+        message = {
+            "type": "http.request",
+            "body": self.body,
+            "more_body": self.more_body,
+        }
+        self.body = b""
+        return message
+
 
 class HTTPConn(asyncio.Protocol):
 
@@ -276,7 +371,7 @@ class HTTPConn(asyncio.Protocol):
         Called by the transport when the write buffer goes below the low water mark
         """
         self.flow_control.resume_writing()
-        
+
 
 
 async def main():
