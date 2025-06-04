@@ -16,11 +16,12 @@ import asyncio
 import http
 from typing import Literal
 from ._types import ASGIVersions, HTTPScope
-from .flow_control import FlowControl
+from .flow_control import FlowControl, HIGH_WATER_LIMIT_READ
 from .server_state import SeverState
 from .config import Config
 import h11
 from .util import get_local_addr, get_remote_addr, is_ssl
+from urllib.parse import unquote
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,9 @@ class RequestResponseCycle:
         self.response_complete = False
         self.disconnected = False
 
+        self.body = b""
+        self.more_body = True
+
 
 class HTTPConn(asyncio.Protocol):
 
@@ -65,6 +69,8 @@ class HTTPConn(asyncio.Protocol):
         self.client: tuple[str, int] | None = None
         self.server: tuple[str, int] | None = None
         self.scheme = Literal["http", "https"] | None = None
+        self.root_path = config.root_path
+        self.app_state = {}
 
         # Shared server state
         self.server_state = server_state
@@ -130,7 +136,38 @@ class HTTPConn(asyncio.Protocol):
                 self.send_400_response(msg)
 
             if event is h11.NEED_DATA:
+                """
+                happens when there isnt enough bytes to parse the next event.
+                """
                 return
+            
+            if event is h11.Request:
+                """
+                server has read enough bytes to identify the start of a new HTTP request, including its method(GET, POST, etc.), path, headers, and HTTP version.
+                """
+                self.headers = [(key.lower(), value) for key, value in event.headers]
+                raw_path, _, query_string = event.target.partition(b"?") # raw target path from HTTP request line -> b"/users?id=1234&name=xyz" will be split into b"/users" and b"id=1234&name=xyz"
+                path = unquote(raw_path.decode("ascii")) # HTTP paths are generally ascii encoded, unquote will decode the url encoded characters (e.g. %20 -> space)
+                full_path = self.root_path + path
+                full_raw_path = self.root_path.encode("ascii") + raw_path
+
+                self.scope = HTTPScope(
+                    type="http",
+                    asgi= {"version": self.config.asgi_version, "spec_version": "2.3"},
+                    http_version=event.http_version.decode("ascii"),
+                    method=event.method.decode("ascii"),
+                    scheme=self.scheme,
+                    path=full_path,
+                    raw_path=full_raw_path,
+                    query_string=query_string,
+                    root_path=self.root_path,
+                    headers=self.headers,
+                    client=self.client,
+                    server=self.server,
+                    state=self.app_state.copy()
+                )
+                
+
             
             if isinstance(event, h11.PAUSED):
                 """
@@ -144,13 +181,22 @@ class HTTPConn(asyncio.Protocol):
             
             if isinstance(event, h11.Data):
                 if self.conn.our_state is h11.DONE:
+                    # malformed request, we have sent/recieved the EndOfMessage event, continue and process next event from the h11 buffer (if any pipelined requests are present)
                     continue
+                self.cycle.body +=event.data
+
+                if len(self.cycle.body) > HIGH_WATER_LIMIT_READ:
+                    self.flow_control.pause_reading()
+                self.cycle.message_event.set()
 
             if isinstance(event, h11.EndOfMessage):
                 if self.conn.our_state is h11.DONE:
                     self.transport.resume_reading()
                     self.conn.start_next_cycle()
                     continue
+                """
+                If we reached here, it means that client just finished sending their request but we havent sent our response yet.
+                """
                 self.cycle.more_body = False
                 self.cycle.message_event.set()
                 if self.conn.their_state == h11.MUST_CLOSE:
